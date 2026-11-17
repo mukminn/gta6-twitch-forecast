@@ -49,6 +49,7 @@ PRE_LO, PRE_HI = -8, -1  # pre-release offsets used for the ramp fingerprint
 MIN_COMMON = 4           # ramp points needed before a match score is trusted
 DEFAULT_WEIGHT = 0.35    # weight when the ramp cannot be compared at all
 MIN_DAY_HOURS = 20       # a comparable needs this many release-day hours
+CALIBRATION_MAX = 24     # comparables used by the self-calibration pass
 
 
 def to_epoch(text):
@@ -148,6 +149,88 @@ def persistence_row(p1, hour):
     return [p1 * math.exp(z * spread) for z in ZNORM]
 
 
+def weighted_pool(curves, profile):
+    return [(curve, ramp_weight(curve, profile)) for curve in curves]
+
+
+def ratio_forecast(p1, pool, hours):
+    """{hour: [q05..q95]} from a weighted pool of comparable ratio curves."""
+    out = {}
+    for hour in hours:
+        if not pool:
+            out[hour] = persistence_row(p1, hour)
+            continue
+        pairs = sorted(
+            (math.log(curve[hour - 1] / curve[0]), w)
+            for curve, w in pool
+            if (hour - 1) in curve and curve[hour - 1] > 0
+        )
+        if not pairs:
+            out[hour] = persistence_row(p1, hour)
+            continue
+        logs = [weighted_quantile(pairs, tau) for tau in LEVELS]
+        median = logs[2]
+        logs = [median + (v - median) * SPREAD_SCALE for v in logs]
+        total_weight = sum(w for _, w in pairs)
+        if total_weight < 3.0:
+            # Thin evidence for this hour: lean halfway back to the
+            # persistence spread instead of trusting a sharp shape
+            # drawn from almost no comparable weight.
+            base = persistence_row(p1, hour)
+            logs = [
+                0.5 * v + 0.5 * (math.log(b) - math.log(p1))
+                for v, b in zip(logs, base)
+            ]
+        out[hour] = [p1 * math.exp(v) for v in logs]
+    return out
+
+
+def curve_profile(curve):
+    """Log viewers relative to the curve's own hour 1, by offset."""
+    log_c1 = math.log(curve[0])
+    return {off: math.log(max(1.0, v)) - log_c1 for off, v in curve.items()
+            if off < 0}
+
+
+def self_calibration(curves, pool):
+    """Per-hour median log bias of the model, measured inside the pool.
+
+    Every comparable with a full release day is forecast from the rest of
+    the pool exactly the way the target will be; the median miss per hour
+    is a bias this method provably carries on launches like these, so the
+    target's forecast is shifted by it. Deterministic: the calibration set
+    is the 24 highest-weighted qualifying comparables, in pool order.
+    """
+    ranked = sorted(range(len(curves)),
+                    key=lambda i: (-pool[i][1], i))
+    chosen = []
+    for i in ranked:
+        curve = curves[i]
+        have = sum(1 for off in range(24) if off in curve)
+        if have >= 23:
+            chosen.append(i)
+        if len(chosen) >= CALIBRATION_MAX:
+            break
+    residuals = {h: [] for h in range(2, 25)}
+    for i in chosen:
+        curve = curves[i]
+        rest = [c for j, c in enumerate(curves) if j != i]
+        sub_pool = weighted_pool(rest, curve_profile(curve))
+        fc = ratio_forecast(curve[0], sub_pool, range(2, 25))
+        for h in range(2, 25):
+            if (h - 1) in curve and curve[h - 1] > 0:
+                residuals[h].append(
+                    math.log(curve[h - 1]) - math.log(fc[h][2]))
+    bias = {}
+    for h, vals in residuals.items():
+        if vals:
+            vals = sorted(vals)
+            bias[h] = vals[len(vals) // 2]
+        else:
+            bias[h] = 0.0
+    return bias
+
+
 def forecast_case(case):
     first = next((k for k in case["known"] if k["hour"] == 1), None)
     if first is None:
@@ -156,7 +239,7 @@ def forecast_case(case):
     day_start_epoch = to_epoch(case["day_start"])
     profile = target_profile(case, day_start_epoch, p1)
 
-    pool = []
+    curves = []
     for comp in case.get("comparables") or []:
         curve = comparable_curve(comp)
         if 0 not in curve or curve[0] <= 0:
@@ -164,37 +247,20 @@ def forecast_case(case):
         have = sum(1 for off in range(24) if off in curve)
         if have < MIN_DAY_HOURS:
             continue
-        pool.append((curve, ramp_weight(curve, profile)))
+        curves.append(curve)
+    pool = weighted_pool(curves, profile)
+    hours = [spec["hour"] for spec in case["forecast"]]
+    forecast = ratio_forecast(p1, pool, hours)
+    if curves:
+        bias = self_calibration(curves, pool)
+        for hour in hours:
+            shift = math.exp(bias.get(hour, 0.0))
+            forecast[hour] = [q * shift for q in forecast[hour]]
 
     rows = []
     for spec in case["forecast"]:
         hour = spec["hour"]
-        if not pool:
-            quantiles = persistence_row(p1, hour)
-        else:
-            pairs = sorted(
-                (math.log(curve[hour - 1] / curve[0]), w)
-                for curve, w in pool
-                if (hour - 1) in curve and curve[hour - 1] > 0
-            )
-            if not pairs:
-                quantiles = persistence_row(p1, hour)
-            else:
-                logs = [weighted_quantile(pairs, tau) for tau in LEVELS]
-                median = logs[2]
-                logs = [median + (v - median) * SPREAD_SCALE for v in logs]
-                total_weight = sum(w for _, w in pairs)
-                if total_weight < 3.0:
-                    # Thin evidence for this hour: lean halfway back to the
-                    # persistence spread instead of trusting a sharp shape
-                    # drawn from almost no comparable weight.
-                    base = persistence_row(p1, hour)
-                    logs = [
-                        0.5 * v + 0.5 * (math.log(b) - math.log(p1))
-                        for v, b in zip(logs, base)
-                    ]
-                quantiles = [p1 * math.exp(v) for v in logs]
-        quantiles = [min(1e9, max(0.5, q)) for q in quantiles]
+        quantiles = [min(1e9, max(0.5, q)) for q in forecast[hour]]
         for i in range(1, len(quantiles)):
             quantiles[i] = max(quantiles[i], quantiles[i - 1])
         rows.append({"hour": hour, "q": [round(q, 2) for q in quantiles]})
